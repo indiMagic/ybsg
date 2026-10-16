@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ybsg"
+version = "1.0.0"
+description = "Yocto Board Support Generator: pick a SoC or board, peripherals and drivers; get a Yocto BSP layer and a PDF report."
+requires-python = ">=3.10"
+dependencies = ["reportlab>=4.0"]
+license = { text = "Proprietary - Codewave Labs, Canada" }
+
+[project.optional-dependencies]
+window = ["pywebview>=5"]
+dev = ["pytest", "playwright", "pyinstaller>=6"]
+
+[project.scripts]
+ybsg = "ybsg.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ybsg*"]
+
+[tool.setuptools.package-data]
+ybsg = ["data/*.json", "web/*", "web/locales/*", "branding.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

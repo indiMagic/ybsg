@@ -1,0 +1,45 @@
+name: build
+on:
+  push: { branches: [main], tags: ["v*"] }
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install -e .[dev]
+      - run: python -m pytest -q
+      - run: python -m playwright install --with-deps chromium
+      - run: |
+          python -m ybsg gui --port 8765 --no-window &
+          sleep 3
+          mkdir -p docs/screenshots
+          python tests/ui_smoke.py && python tests/ui_dnd.py
+  package:
+    needs: test
+    strategy:
+      matrix: { os: [windows-latest, ubuntu-latest] }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - run: pip install -e .[window,dev]
+      - if: runner.os == 'Windows'
+        run: choco install innosetup -y
+      - run: python packaging/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ybsg-${{ matrix.os }}
+          path: |
+            dist/ybsg-portable*
+            dist/ybsg-setup.exe
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
+            dist/SHA256SUMS.txt
+      # Code signing (NFR-13): add your certificate as a secret, then sign before upload, for example:
+      #   signtool sign /f cert.pfx /p ${{ secrets.SIGN_PW }} dist\ybsg-setup.exe
+      #   gpg --detach-sign --armor dist/ybsg-*.tar.gz

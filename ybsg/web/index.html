@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="ybsg-token" content="__YBSG_TOKEN__">
+<title>YBSG</title>
+<link rel="stylesheet" href="/app.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2314233a'/%3E%3Crect x='9' y='9' width='14' height='14' rx='2' fill='none' stroke='%23d9b04a' stroke-width='2'/%3E%3Cpath d='M4 13h5M4 19h5M23 13h5M23 19h5' stroke='%234cc3d9' stroke-width='2'/%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<div id="splash" role="status" aria-live="polite">
+  <div class="splash-card">
+    <svg class="splash-mark" viewBox="0 0 64 64" aria-hidden="true"><rect x="18" y="18" width="28" height="28" rx="4" fill="none" stroke="currentColor" stroke-width="3"/><path d="M6 26h12M6 38h12M46 26h12M46 38h12M26 6v12M38 6v12M26 46v12M38 46v12" stroke="var(--trace)" stroke-width="3" fill="none"/></svg>
+    <div class="splash-name" data-brand="product">YBSG</div>
+    <div class="splash-long" data-brand="product_long">Yocto Board Support Generator</div>
+    <div class="splash-step" id="splash-step">Starting</div>
+    <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="splash-bar"><i></i></div>
+    <div class="splash-meta"><span id="splash-ver"></span></div>
+    <div class="splash-company" data-brand="company">Codewave Labs, Canada</div>
+    <div id="splash-err" hidden>
+      <p id="splash-err-text"></p>
+      <button class="btn" id="splash-log">View log</button>
+    </div>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar" role="banner">
+    <button class="icon-btn" id="menu-toggle" aria-label="Collapse side menu" title="Collapse side menu"><svg viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/></svg></button>
+    <div class="brandmark" aria-hidden="true"><svg viewBox="0 0 32 32"><rect x="9" y="9" width="14" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M4 13h5M4 19h5M23 13h5M23 19h5" stroke="var(--trace)" stroke-width="2"/></svg><b>YBSG</b></div>
+    <button class="cmd" id="cmd-open" aria-label="Search SoC, board, IC, driver. Shortcut Control K"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13.5 13.5 18 18"/></svg><span>Search SoC, board, IC, driver</span><kbd>Ctrl K</kbd></button>
+    <div class="spacer"></div>
+    <label class="proj-name"><span class="sr">Project name</span><input id="proj-name" placeholder="No project open" aria-label="Project name" disabled></label>
+    <span class="chip" id="db-chip" title="Local database"><i class="dot"></i><span>Database: starting</span></span>
+    <div class="menu-wrap">
+      <button class="btn ghost" id="help-btn" aria-haspopup="true" aria-expanded="false">Help</button>
+      <div class="popmenu" id="help-menu" hidden role="menu">
+        <button role="menuitem" data-act="about">About YBSG</button>
+        <button role="menuitem" data-act="shortcuts">Keyboard shortcuts</button>
+      </div>
+    </div>
+    <button class="icon-btn" id="theme-btn" aria-label="Switch theme" title="Switch theme"><svg viewBox="0 0 20 20"><path d="M16 11.5A6.5 6.5 0 0 1 8.5 4 6.5 6.5 0 1 0 16 11.5Z"/></svg></button>
+  </header>
+
+  <div class="body">
+    <nav class="side" id="side" aria-label="Main"></nav>
+    <main id="main" tabindex="-1"></main>
+  </div>
+
+  <footer class="statusbar" role="contentinfo">
+    <span id="sb-job" class="sb-left">No job running</span>
+    <span id="sb-db" class="sb-right">Local database ready</span>
+  </footer>
+</div>
+
+<div id="palette" class="overlay" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Command search">
+    <input id="pal-input" placeholder="Jump to any SoC, board, IC or driver" aria-label="Search" autocomplete="off">
+    <ul id="pal-list" role="listbox"></ul>
+  </div>
+</div>
+<div id="modal" class="overlay" hidden></div>
+<div id="toasts" aria-live="polite" role="status"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

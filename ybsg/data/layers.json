@@ -1,0 +1,24 @@
+{
+  "note": "Release-to-branch map and layer repositories are data, not code (NFR-10). Add a release here and in seed.json; no code change needed.",
+  "layer_series": {"wrynose": "wrynose", "scarthgap": "scarthgap", "master": "wrynose"},
+  "repos": {
+    "poky": {"url": "https://git.yoctoproject.org/poky", "layers": ["meta", "meta-poky", "meta-yocto-bsp"], "branches": {"wrynose": "wrynose", "scarthgap": "scarthgap", "master": "master"}},
+    "meta-openembedded": {"url": "https://git.openembedded.org/meta-openembedded", "layers": ["meta-oe", "meta-python", "meta-networking", "meta-multimedia"], "branches": {"wrynose": "wrynose", "scarthgap": "scarthgap", "master": "master"}},
+    "meta-freescale": {"url": "https://github.com/Freescale/meta-freescale", "layers": ["."], "branches": {"wrynose": "wrynose", "scarthgap": "scarthgap", "master": "master"}},
+    "meta-imx": {"url": "https://github.com/nxp-imx/meta-imx", "layers": ["meta-imx-bsp", "meta-imx-sdk"], "branches": {"wrynose": "master", "scarthgap": "scarthgap-6.6.52-2.2.0", "master": "master"}, "licence_gate": "NXP EULA"},
+    "meta-ti": {"url": "https://git.yoctoproject.org/meta-ti", "layers": ["meta-ti-bsp", "meta-ti-extras"], "branches": {"wrynose": "master", "scarthgap": "scarthgap", "master": "master"}},
+    "meta-st-stm32mp": {"url": "https://github.com/STMicroelectronics/meta-st-stm32mp", "layers": ["."], "branches": {"wrynose": "master", "scarthgap": "scarthgap", "master": "master"}, "licence_gate": "ST EULA"},
+    "meta-rockchip": {"url": "https://git.yoctoproject.org/meta-rockchip", "layers": ["."], "branches": {"wrynose": "master", "scarthgap": "scarthgap", "master": "master"}},
+    "meta-raspberrypi": {"url": "https://git.yoctoproject.org/meta-raspberrypi", "layers": ["."], "branches": {"wrynose": "master", "scarthgap": "scarthgap", "master": "master"}, "licence_gate": "Broadcom firmware licence"},
+    "meta-qt6": {"url": "https://code.qt.io/yocto/meta-qt6.git", "layers": ["."], "branches": {"wrynose": "6.9", "scarthgap": "6.8", "master": "dev"}}
+  },
+  "layer_names": {"meta-freescale": "freescale-layer", "meta-ti": "meta-ti-bsp"},
+  "distro_rootfs": {
+    "ubuntu": {"tool": "debootstrap", "suite": "noble", "mirror": "http://ports.ubuntu.com/ubuntu-ports"},
+    "debian": {"tool": "mmdebstrap", "suite": "trixie", "mirror": "http://deb.debian.org/debian"},
+    "kali": {"tool": "debootstrap", "suite": "kali-rolling", "mirror": "http://http.kali.org/kali"},
+    "fedora": {"tool": "dnf --installroot", "suite": "43", "mirror": "https://dl.fedoraproject.org/pub/fedora/linux/releases"},
+    "archarm": {"tool": "tarball", "suite": "latest", "mirror": "http://os.archlinuxarm.org/os"},
+    "alpine": {"tool": "apk --root", "suite": "v3.22", "mirror": "https://dl-cdn.alpinelinux.org/alpine"}
+  }
+}

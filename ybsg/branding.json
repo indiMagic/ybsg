@@ -1,0 +1,13 @@
+{
+  "product": "YBSG",
+  "product_long": "Yocto Board Support Generator",
+  "company": "Codewave Labs, Canada",
+  "designer": "Indeep Sidhu",
+  "website": "codewavelabs.ca",
+  "website_url": "https://codewavelabs.ca",
+  "rights": "© 2026 Codewave Labs, Canada. All rights reserved.",
+  "version": "1.0.0",
+  "build_number": "1000",
+  "build_date": "2026-10-16",
+  "yocto_baseline": "Yocto Project 6.0 \"Wrynose\" LTS, Linux 6.18 LTS"
+}
