@@ -1,0 +1,6 @@
+{
+  "note": "DB-10: public keys trusted to sign data/seed.json (Ed25519, hex). The private key is kept outside the repository; see tools/sign_snapshot.py.",
+  "keys": [
+    {"public_key": "2d73a94fc8e8c04bb4ec41a246b67f20e8405d60d7ad9b20c0b956fe0f75820c", "owner": "Codewave Labs release key", "created": "2026-10-16"}
+  ]
+}

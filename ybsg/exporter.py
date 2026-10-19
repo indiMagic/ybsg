@@ -7,11 +7,13 @@ import zipfile
 from pathlib import Path
 
 SKIP = {".git"}
+TOP_SKIP = {"sources", "build", "cache", "ycl-build"}  # fetched layers, BitBake work dirs and caches are not part of the BSP
 
 
 def _files(root: Path):
     for f in sorted(root.rglob("*")):
-        if f.is_file() and not (SKIP & set(f.relative_to(root).parts)) and not f.name.endswith(".ybsg-new"):
+        rel = f.relative_to(root).parts
+        if f.is_file() and not (SKIP & set(rel)) and rel[0] not in TOP_SKIP and not f.name.endswith(".ybsg-new"):
             yield f
 
 

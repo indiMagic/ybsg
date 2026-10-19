@@ -20,7 +20,9 @@ ybsg validate my.ybsg
 ybsg generate my.ybsg --offline -o out        # add --build to run BitBake through kas
 ybsg export out --zip bsp.zip --git bsp-repo
 ybsg search "imx 8m mini"
-ybsg doctor                                   # build backend and host resources
+ybsg doctor                                   # build backend, WSL2, remote builder, host resources
+ybsg generate my.ybsg --build --remote me@buildhost:/srv/ybsg   # build over ssh
+ybsg update                                   # signed self-update (portable build, AppImage)
 ```
 
 Without a native window the app opens in a Chromium `--app` window or your browser. Data lives in `~/.local/share/ybsg` (set `YBSG_HOME` to change it).
@@ -37,11 +39,13 @@ File generation and the report need nothing else. To run BitBake from YBSG insta
 
 ```
 pip install -e .[dev]
-pytest                                  # 27 tests
+pytest                                  # 44 tests
 python -m ybsg gui --port 8765 --no-window &
 python tests/ui_smoke.py && python tests/ui_dnd.py   # headless Chromium, writes docs/screenshots
                                         # YBSG_CHROMIUM=/usr/bin/google-chrome to use an installed browser
+python tests/ui_a11y.py URL axe.min.js && python tests/ui_perf.py URL   # WCAG audit, frame rate
 python tools/extract_strings.py         # refresh locales/en.json
+python tools/sign_snapshot.py --key KEY # re-sign data/seed.json after editing it (the app refuses a stale signature)
 python packaging/build.py               # executables + SHA256SUMS for this OS
 ```
 

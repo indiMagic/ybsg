@@ -1,8 +1,11 @@
 """PDF / Markdown / JSON report built ONLY from the pinned manifest (RPT-1, RPT-2): offline, no catalog access."""
 from __future__ import annotations
 
+import base64
+import io
 import json
 import shutil
+import threading
 import zlib
 import subprocess
 from pathlib import Path
@@ -12,7 +15,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
-from reportlab.platypus import (BaseDocTemplate, Frame, PageBreak, PageTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether)
+from reportlab.platypus import (Image, BaseDocTemplate, Frame, PageBreak, PageTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether)
 from reportlab.platypus.tableofcontents import TableOfContents
 
 from .branding import brand
@@ -20,6 +23,52 @@ from .branding import brand
 INK = colors.HexColor("#1b2430")
 ACCENT = colors.HexColor("#1f6feb")
 SOFT = colors.HexColor("#eef2f7")
+_DEFAULT = (INK, ACCENT)
+_LOCK = threading.Lock()  # colours are module state while one PDF builds
+
+TEMPLATE_KEYS = {"name", "organisation", "website", "footer", "accent", "ink", "logo", "cover_note", "prepared_for", "extra_sections"}
+
+
+def template_dir() -> Path:
+    from . import paths
+    return paths.data_dir() / "report-templates"
+
+
+def list_templates() -> list[dict]:
+    """RPT-5: per-organisation report templates, one JSON file each in <data>/report-templates/."""
+    out = []
+    for f in sorted(template_dir().glob("*.json")):
+        try:
+            t = json.loads(f.read_text(encoding="utf-8"))
+            out.append({"id": f.stem, "name": t.get("name") or f.stem, "organisation": t.get("organisation", "")})
+        except (OSError, ValueError):
+            out.append({"id": f.stem, "name": f.stem, "organisation": "", "error": "not valid JSON"})
+    return out
+
+
+def load_template(tid: str | None) -> dict | None:
+    """Read and check a template; the logo (PNG/JPEG, at most 512 KB) is inlined so the manifest alone rebuilds the report."""
+    if not tid:
+        return None
+    f = template_dir() / f"{Path(tid).name}.json"
+    if not f.exists():
+        raise FileNotFoundError(f"report template '{tid}' not found in {template_dir()}")
+    t = json.loads(f.read_text(encoding="utf-8"))
+    unknown = set(t) - TEMPLATE_KEYS
+    if unknown:
+        raise ValueError(f"report template '{tid}': unknown keys {sorted(unknown)} (allowed: {sorted(TEMPLATE_KEYS)})")
+    for k in ("accent", "ink"):
+        if k in t:
+            colors.HexColor(t[k])  # raises on a bad colour
+    t["id"] = f.stem
+    if t.get("logo"):
+        lf = (f.parent / t["logo"]).resolve()
+        data = lf.read_bytes()
+        if len(data) > 512 * 1024 or data[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb"):
+            raise ValueError(f"report template '{tid}': logo must be a PNG or JPEG of at most 512 KB")
+        t["logo"] = {"name": lf.name, "base64": base64.b64encode(data).decode()}
+    t["extra_sections"] = [{"title": str(x["title"]), "body": str(x.get("body", ""))} for x in t.get("extra_sections", [])]
+    return t
 
 
 def _esc(s) -> str:
@@ -37,11 +86,12 @@ class _Doc(BaseDocTemplate):
         self._bm = 0
 
     def _footer(self, canv, doc) -> None:
-        b = brand()
+        b, t = brand(), self.m.get("report_template") or {}
         canv.saveState()
         canv.setFont("Helvetica", 7.5)
         canv.setFillColor(colors.HexColor("#5b6675"))
-        canv.drawString(18 * mm, 11 * mm, f"{b['company']}  |  {b['website']}  |  {b['rights']}")
+        left = t.get("footer") or (f"{t['organisation']}  |  {t.get('website', '')}  |  Generated with {b['product']}" if t.get("organisation") else f"{b['company']}  |  {b['website']}  |  {b['rights']}")
+        canv.drawString(18 * mm, 11 * mm, left)
         canv.drawRightString(A4[0] - 18 * mm, 11 * mm, f"Page {doc.page}")
         canv.setStrokeColor(colors.HexColor("#d5dbe3"))
         canv.line(18 * mm, 14.5 * mm, A4[0] - 18 * mm, 14.5 * mm)
@@ -109,19 +159,41 @@ def _diagram(m: dict, width: float) -> Drawing:
 
 
 def build_pdf(manifest: dict, out: Path, flashing_text: str = "") -> Path:
+    global INK, ACCENT
+    tpl = manifest.get("report_template") or {}
+    with _LOCK:
+        INK = colors.HexColor(tpl["ink"]) if tpl.get("ink") else _DEFAULT[0]
+        ACCENT = colors.HexColor(tpl["accent"]) if tpl.get("accent") else _DEFAULT[1]
+        try:
+            return _build_pdf(manifest, out, flashing_text, tpl)
+        finally:
+            INK, ACCENT = _DEFAULT
+
+
+def _build_pdf(manifest: dict, out: Path, flashing_text: str, tpl: dict) -> Path:
     st = _styles()
     doc = _Doc(str(out), manifest)
     m, W = manifest, doc.width
     s: list = []
     b = brand()
     # cover
-    s += [Spacer(1, 45 * mm), Paragraph("BSP", ParagraphStyle("k", fontName="Helvetica-Bold", fontSize=11, textColor=ACCENT)), Spacer(1, 3 * mm),
+    if tpl.get("logo"):
+        img = Image(io.BytesIO(base64.b64decode(tpl["logo"]["base64"])))
+        scale = min(50 * mm / img.drawWidth, 20 * mm / img.drawHeight, 1e9)
+        img.drawWidth, img.drawHeight = img.drawWidth * scale, img.drawHeight * scale
+        img.hAlign = "LEFT"
+        s += [img, Spacer(1, 20 * mm)]
+    else:
+        s += [Spacer(1, 45 * mm)]
+    s += [Paragraph("BSP", ParagraphStyle("k", fontName="Helvetica-Bold", fontSize=11, textColor=ACCENT)), Spacer(1, 3 * mm),
           Paragraph(_esc(m["project"]["name"]), st["T"]), Paragraph("Board support package report", st["Sub"]), Spacer(1, 14 * mm)]
     cover = [["Date (manifest)", m["tool"]["database_synced"][:10] or "n/a"], ["Tool", f"{m['tool']['name']} {m['tool']['version']}"], ["Database version", m["tool"]["database_version"]],
-             ["Author", m["project"]["author"]], ["Company", b["company"]], ["Website", b["website"]], ["Project hash", m["project"]["hash"][:24] + "..."]]
+             ["Author", m["project"]["author"]], ["Company", tpl.get("organisation") or b["company"]], ["Website", tpl.get("website") or b["website"]], ["Project hash", m["project"]["hash"][:24] + "..."]]
+    if tpl.get("prepared_for"):
+        cover.insert(4, ["Prepared for", tpl["prepared_for"]])
     t = Table([[Paragraph(_esc(a), st["S"]), Paragraph(_esc(v), st["B"])] for a, v in cover], colWidths=[40 * mm, W - 40 * mm])
     t.setStyle(TableStyle([("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.HexColor("#d5dbe3")), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
-    s += [t, Spacer(1, 10 * mm), Paragraph(_esc(b["rights"]), st["S"]), PageBreak()]
+    s += [t, Spacer(1, 10 * mm)] + ([Paragraph(_esc(tpl["cover_note"]), st["B"]), Spacer(1, 4 * mm)] if tpl.get("cover_note") else []) + [Paragraph(_esc(b["rights"]), st["S"]), PageBreak()]
     # contents
     toc = TableOfContents()
     toc.levelStyles = [ParagraphStyle("t1", fontName="Helvetica-Bold", fontSize=10, leftIndent=0, spaceBefore=4), ParagraphStyle("t2", fontName="Helvetica", fontSize=9, leftIndent=12)]
@@ -181,6 +253,13 @@ def build_pdf(manifest: dict, out: Path, flashing_text: str = "") -> Path:
     s += [Paragraph("10. Licence summary", st["H1"]), Paragraph("Licences present: " + _esc("; ".join(m["licences"])), st["B"])]
     if m["licence_gates"]:
         s += [Paragraph("Licence acceptance required by you (YBSG never accepts on your behalf): " + _esc("; ".join(m["licence_gates"])), st["B"])]
+    comps = (m.get("build") or {}).get("component_licences") or []
+    if comps:
+        s += [Spacer(1, 2 * mm), Paragraph(f"Per-package licences of the built image ({len(comps)} packages, from BitBake's license.manifest):", st["B"]), Spacer(1, 1 * mm)]
+        s += [_table([["Package", "Version", "Recipe", "Licence"]] + [[c.get("package", ""), c.get("version", ""), c.get("recipe", ""), c.get("licence", "")] for c in comps],
+                     [45 * mm, 30 * mm, 45 * mm, W - 120 * mm], st)]
+    else:
+        s += [Paragraph("Per-package licence inventory: available after a BitBake build (from license.manifest).", st["S"])]
     # build
     s += [Paragraph("11. Build results", st["H1"])]
     rows = [["Stage", "State", "Detail"]] + [[k, v["state"], v["message"]] for k, v in m["stages"].items()]
@@ -191,8 +270,12 @@ def build_pdf(manifest: dict, out: Path, flashing_text: str = "") -> Path:
     s += [Paragraph("12. Flashing guide", st["H1"])]
     for ln in (flashing_text or "See FLASHING.md in the output folder.").splitlines():
         s.append(Paragraph(_esc(ln) if ln.strip() else "&nbsp;", st["M"] if ln.startswith(("sudo", "uuu", "flashcp", "rk", "dfu", "STM32", "zcat", "dd")) else st["S"]))
+    n = 12
+    for sec in tpl.get("extra_sections", []):  # RPT-5: organisation sections
+        n += 1
+        s += [Paragraph(f"{n}. {_esc(sec['title'])}", st["H1"])] + [Paragraph(_esc(para) if para.strip() else "&nbsp;", st["B"]) for para in sec["body"].split("\n")]
     from . import plugins as _pl
-    for n, (title, fn) in enumerate(_pl.REPORT_SECTIONS, 13):  # NFR-11: third-party report sections
+    for n, (title, fn) in enumerate(_pl.REPORT_SECTIONS, n + 1):  # NFR-11: third-party report sections
         try:
             lines = list(fn(m))
         except Exception as e:  # noqa: BLE001
@@ -204,7 +287,9 @@ def build_pdf(manifest: dict, out: Path, flashing_text: str = "") -> Path:
 
 def to_markdown(m: dict) -> str:
     sm = m["summary"]
-    L = [f"# {m['project']['name']}: BSP report", "", f"{brand()['company']} | {brand()['website']} | {brand()['rights']}", "", "## Summary", "",
+    tpl = m.get("report_template") or {}
+    head = f"{tpl['organisation']} | {tpl.get('website', '')}" + (f" | prepared for {tpl['prepared_for']}" if tpl.get("prepared_for") else "") if tpl.get("organisation") else f"{brand()['company']} | {brand()['website']} | {brand()['rights']}"
+    L = [f"# {m['project']['name']}: BSP report", "", head, ""] + ([tpl["cover_note"], ""] if tpl.get("cover_note") else []) + ["## Summary", "",
          f"- Target: {m['project']['board']} ({m['project']['soc']})", f"- Release: {sm['release']}", f"- Kernel: {sm['kernel']}", f"- Image: {sm['image']}", f"- Machine: `{sm['machine']}`", "", "## Peripherals", "",
          "| Category | Instance | IC | Vendor | Interface | Pins |", "|---|---|---|---|---|---|"]
     L += [f"| {p['category']} | {p['instance']} | {p['ic']} | {p['vendor']} | {p['interface']} | {p['pins']} |" for p in m["peripherals"]]
@@ -213,6 +298,11 @@ def to_markdown(m: dict) -> str:
     L += ["", "## Software stack", "", "| Repo | Branch | Commit |", "|---|---|---|"] + [f"| {l['repo']} | {l['branch']} | `{l['commit']}` |" for l in m["layers"]]
     L += ["", "## Files", "", "| Path | Purpose | SHA-256 |", "|---|---|---|"] + [f"| `{k}` | {v['purpose']} | `{v['sha256']}` |" for k, v in m["files"].items()]
     L += ["", "## Warnings and waivers", ""] + [f"- **{w['severity']}** {w['code']}: {w['message']}{' (waived)' if w['waived'] else ''}" for w in m["warnings"]]
+    comps = (m.get("build") or {}).get("component_licences") or []
+    if comps:
+        L += ["", "## Package licences", "", "| Package | Version | Recipe | Licence |", "|---|---|---|---|"] + [f"| {c.get('package', '')} | {c.get('version', '')} | {c.get('recipe', '')} | {c.get('licence', '')} |" for c in comps]
+    for sec in tpl.get("extra_sections", []):
+        L += ["", f"## {sec['title']}", "", sec["body"]]
     return "\n".join(L) + "\n"
 
 

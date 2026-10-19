@@ -48,6 +48,13 @@ class App:
         return self._sync
 
     @property
+    def pictures(self):
+        if not getattr(self, "_pictures", None):
+            from .pictures import PictureQueue
+            self._pictures = PictureQueue(self.cat)
+        return self._pictures
+
+    @property
     def graph(self) -> CapabilityGraph:
         return CapabilityGraph(self.cat)
 
@@ -164,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
             if ent == "board":
                 rec["soc_rec"] = a.cat.get("soc", rec["soc"])
                 img = a.cat.get_image(rec["id"])
-                rec["image"] = {k: img[k] for k in ("source_url", "licence", "attribution", "shareable", "fetched")} if img else None
+                rec["image"] = {k: img[k] for k in ("source_url", "licence", "attribution", "shareable", "fetched")} if img and img["source_url"] != "ybsg:generated" else None
             if ent == "ic":
                 rec["drivers"] = a.cat.drivers_for_ic(rec["id"])
             return self._json(rec)
@@ -172,7 +179,7 @@ class Handler(BaseHTTPRequestHandler):
             b = a.cat.get("board", ep.split("/", 1)[1])
             if not b:
                 return self._send(404, b"", "text/plain")
-            img = ensure_image(a.cat, b)
+            img = ensure_image(a.cat, b, a.pictures)
             return self._send(200, img["blob"], img["mime"])
         if ep == "project":
             return self._json({"project": a.project, "validation": a.graph.validate(a.project) if a.project else None})
@@ -195,7 +202,16 @@ class Handler(BaseHTTPRequestHandler):
         if ep == "history":
             return self._json(history(a.project["uid"]) if a.project else [])
         if ep == "db/status":
-            return self._json({"status": a.sync.status, "log": a.cat.recent_log(20), "discovered": a.sync.discovered(), "size": a.cat.size_bytes(), "last_checked": a.cat.get_meta("last_checked")})
+            return self._json({"status": a.sync.status, "log": a.cat.recent_log(20), "discovered": a.sync.discovered(), "size": a.cat.size_bytes(), "last_checked": a.cat.get_meta("last_checked"), "signature": a.cat.get_meta("seed_signature")})
+        if ep == "settings":
+            from .orchestrator import settings, find_build_backend
+            return self._json({**settings(), "local_backend": find_build_backend()})
+        if ep == "update/check":
+            from . import update
+            return self._json(update.check())
+        if ep == "report_templates":
+            from .report import list_templates, template_dir
+            return self._json({"templates": list_templates(), "folder": str(template_dir())})
         if ep == "reports":
             out = []
             for uid, d in a.outdirs.items():
@@ -245,12 +261,16 @@ class Handler(BaseHTTPRequestHandler):
                     "detail": f"{soc['name']} supports: {', '.join(soc['kernels'])}"})
         bad = [i for i in a.graph.validate(p)["issues"] if i["code"] == "driver-kernel-mismatch"]
         out.append({"label": "Drivers exist in this kernel", "state": "fail" if bad else "ok", "detail": bad[0]["message"] if bad else "Every selected driver is in range"})
-        layers = json.loads((Path(__file__).parent / "data" / "layers.json").read_text())["repos"]
-        rows = []
+        from .discover import load_layers
+        data = load_layers()
+        rows, mism = [], []
         for l in soc.get("layers", []):
-            br = layers.get(l, {}).get("branches", {})
-            rows.append(f"{l}: {br.get(p['release'], 'no branch for this release')}")
-        mism = [l for l in soc.get("layers", []) if p["release"] not in layers.get(l, {}).get("branches", {})]
+            ent = data["layer_catalog"].get(l)
+            repo = (ent["repo"] if isinstance(ent["repo"], str) else ent["repo"].get(p["release"], ent["repo"]["default"])) if ent else None
+            br = data["repos"].get(repo, {}).get("branches", {}).get(p["release"]) if repo else None
+            rows.append(f"{l}: {br or 'no branch for this release'}")
+            if not br:
+                mism.append(l)
         out.append({"label": "Vendor layer matches release", "state": "warn" if mism else "ok", "detail": "; ".join(rows) or "No vendor layer required"})
         gate = soc.get("licence_gate", "none")
         needs = bool(gate) and not gate.lower().startswith("none")
@@ -283,14 +303,14 @@ class Handler(BaseHTTPRequestHandler):
             P.autosave(a.project)
             return self._json({"project": a.project, "validation": a.graph.validate(a.project)})
         if ep == "project/open":
-            a.project = P.load_saved(b["uid"])
+            a.project = P.normalize_ids(c, P.load_saved(b["uid"]))
             return self._json({"project": a.project, "validation": a.graph.validate(a.project)})
         if ep == "project/import":
             import tempfile
             import base64
             tmp = Path(tempfile.mkdtemp()) / "in.ybsg"
             tmp.write_bytes(base64.b64decode(b["data"]))
-            a.project = P.load(tmp)
+            a.project = P.normalize_ids(c, P.load(tmp))
             shutil.rmtree(tmp.parent, ignore_errors=True)
             P.autosave(a.project)
             return self._json({"project": a.project, "validation": a.graph.validate(a.project)})
@@ -301,7 +321,7 @@ class Handler(BaseHTTPRequestHandler):
         if not a.project and ep.startswith("project/"):
             return self._json({"error": "No project open"}, 400)
         if ep == "project/set":
-            for k in ("name", "kernel", "release", "image", "distro", "author", "overlay_mode"):
+            for k in ("name", "kernel", "release", "image", "distro", "author", "overlay_mode", "report_template"):
                 if k in b:
                     a.project[k] = b[k]
             if "ram" in b:
@@ -347,6 +367,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "Generate the project first"}, 400)
             dest = exporter.export_git(d, Path(b["dest"]).expanduser())
             return self._json({"repo": str(dest)})
+        elif ep == "settings":
+            from .orchestrator import save_settings
+            rb = str(b.get("remote_builder", "")).strip()
+            if rb and (rb.startswith("-") or any(c in rb for c in " ;|&`$'\"\n")):
+                return self._json({"error": "Remote builder must look like user@host:/dir"}, 400)
+            return self._json(save_settings(remote_builder=rb))
+        elif ep == "update/apply":
+            from . import update
+            return self._json(update.apply(update.check()))
         elif ep == "project/autosave":
             P.autosave(a.project); a._dirty = False
             return self._json({"ok": True})
@@ -370,8 +399,32 @@ class Handler(BaseHTTPRequestHandler):
             a.sync.run_async(a.sync.check_updates, b.get("ids") or None, b.get("branch", "wrynose"), bool(b.get("apply")))
             return self._json({"started": True})
         elif ep == "db/find":
-            a.sync.run_async(a.sync.find_more_boards, b.get("branch", "wrynose"))
+            a.sync.run_async(a.sync.find_boards_online, "", b.get("branch", "wrynose"))
             return self._json({"started": True})
+        elif ep == "image/find":
+            from .pictures import fetch_for
+            board = c.get("board", b["id"])
+            if not board:
+                return self._json({"error": "unknown board"}, 404)
+            return self._json({"result": fetch_for(c, board, force=True)})
+        elif ep == "image/upload":
+            import base64
+            board = c.get("board", b["id"])
+            data = base64.b64decode(b["data"])
+            if not board or len(data) > 5 * 1024 * 1024 or data[:4] not in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"\xff\xd8\xff\xdb", b"RIFF"):
+                return self._json({"error": "Use a PNG, JPEG or WebP picture of at most 5 MB"}, 400)
+            mime = "image/png" if data[:4] == b"\x89PNG" else "image/webp" if data[:4] == b"RIFF" else "image/jpeg"
+            c.set_image(board["id"], mime, data, source_url="user", licence="your own picture", attribution="you", shareable=False)
+            return self._json({"result": "saved"})
+        elif ep == "board/from_url":
+            from .fromurl import LinkError, add_from_url
+            try:
+                return self._json(add_from_url(c, str(b.get("url", "")), b.get("branch", "wrynose")))
+            except (LinkError, OSError, RuntimeError) as e:
+                return self._json({"error": str(e)}, 400)
+        elif ep == "search/online":
+            res = a.sync.find_boards_online(str(b.get("q", ""))[:100], b.get("branch", "wrynose"))
+            return self._json(res)
         elif ep == "db/download":
             a.sync.run_async(a.sync.download_discovered, b["ids"])
             return self._json({"started": True})

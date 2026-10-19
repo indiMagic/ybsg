@@ -21,7 +21,7 @@ ybsg = "ybsg.cli:main"
 include = ["ybsg*"]
 
 [tool.setuptools.package-data]
-ybsg = ["data/*.json", "web/*", "web/locales/*", "branding.json"]
+ybsg = ["data/*.json", "data/*.sig", "web/*", "web/locales/*", "branding.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

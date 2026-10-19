@@ -1,0 +1,18 @@
+{
+  "note": "DB-6: vendor aliases. Each key is the canonical vendor name; values are names the same company appears under in vendor, layer-index and community data. Data, not code (NFR-10).",
+  "vendors": {
+    "NXP": ["Freescale", "NXP Semiconductors", "Freescale Semiconductor", "fsl"],
+    "Texas Instruments": ["TI", "Texas Instruments Inc."],
+    "STMicroelectronics": ["ST", "STM", "ST Microelectronics"],
+    "Broadcom": ["BCM", "Broadcom Inc."],
+    "Rockchip": ["Rockchip Electronics", "RK"],
+    "Raspberry Pi": ["Raspberry Pi Foundation", "Raspberry Pi Ltd", "RPi"],
+    "BeagleBoard.org": ["BeagleBoard", "Beagle"],
+    "Cypress/Infineon": ["Cypress", "Infineon", "Infineon Technologies"],
+    "Analog Devices": ["ADI", "Analog Devices Inc."],
+    "Microchip": ["Atmel", "Microchip Technology"],
+    "TDK InvenSense": ["InvenSense", "TDK"],
+    "Qualcomm Atheros": ["Atheros", "QCA"],
+    "Bosch": ["Bosch Sensortec"]
+  }
+}

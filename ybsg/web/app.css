@@ -2,7 +2,7 @@
    Status is never colour alone: every state also has a shape and a word. */
 :root {
   --mask: #101c2e; --mask-2: #15253b; --mask-3: #1c3050; --line: #2a4165; --line-soft: #1f3250;
-  --silk: #e7edf6; --silk-dim: #9fb0c8; --silk-faint: #6f819b;
+  --silk: #e7edf6; --silk-dim: #9fb0c8; --silk-faint: #8a9bb3;
   --gold: #e0b94f; --gold-ink: #241c05; --trace: #4cc3d9; --ok: #52c7a7; --warn: #e0b94f; --err: #f0795d; --info: #7aa7ff;
   --bg: var(--mask); --panel: var(--mask-2); --panel-2: var(--mask-3); --text: var(--silk); --text-dim: var(--silk-dim);
   --accent: var(--gold); --accent-ink: var(--gold-ink); --focus: #ffe08a;
@@ -172,3 +172,6 @@ label.f { display: flex; flex-direction: column; gap: 4px; color: var(--text-dim
 .motion-off *, .motion-off *::before { transition: none !important; animation: none !important; }
 @media (prefers-reduced-motion: reduce) { *, *::before { transition: none !important; animation: none !important; } }
 @media (max-width: 860px) { main { padding: 16px; } .side { position: fixed; z-index: 60; top: 48px; bottom: 28px; transform: translateX(-100%); } body:not(.nav-collapsed) .side { transform: none; } .proj-name, .cmd span, .cmd kbd { display: none; } }
+/* UI-5: large catalogues. Off-screen cards skip layout and paint; the relationship graph scrolls as one composited layer. */
+.cards > div.bcard { content-visibility: auto; contain-intrinsic-size: auto 250px; }
+.graph-svg { will-change: transform; contain: paint; }

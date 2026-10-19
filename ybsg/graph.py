@@ -191,6 +191,10 @@ class CapabilityGraph:
         soc = self.soc(p)
         board = self.cat.get("board", p["board"]) if p.get("board") else None
 
+        if not p.get("soc") and board:
+            issues.append(Issue("board-soc-unknown", "error", f"{board['name']} is listed from {', '.join(board.get('layers', [])) or 'a layer'}, but its SoC is not in the catalogue yet",
+                                "Pick a board on a supported SoC, or add this SoC as a user record (Local database)", "", "invalid", True, False))
+            return self._pack(p, issues, {})
         if not p.get("soc"):
             issues.append(Issue("no-soc", "error", "No SoC or board selected", "Pick a board or a SoC in Library", "", "invalid", True, False))
             return self._pack(p, issues, {})
@@ -218,6 +222,14 @@ class CapabilityGraph:
                                 "", "", "data", False))
             if not p.get("distro"):
                 issues.append(Issue("distro-missing", "error", "Distro image chosen but no distribution selected", "Pick Ubuntu, Debian, Kali, Fedora, Arch ARM or Alpine", "", "invalid"))
+            else:
+                import json
+                from pathlib import Path
+                rootfs = json.loads((Path(__file__).parent / "data" / "layers.json").read_text())["distro_rootfs"].get(p["distro"], {})
+                arch = "arm64" if soc.get("arch") == "arm64" else "armhf"
+                if rootfs and arch not in rootfs.get("arch", {}):
+                    issues.append(Issue("distro-arch", "error", f"{p['distro']} has no {arch} root filesystem for {soc['name']}",
+                                        f"Choose one of: {', '.join(k for k, v in json.loads((Path(__file__).parent / 'data' / 'layers.json').read_text())['distro_rootfs'].items() if arch in v.get('arch', {}))}", "", "invalid"))
 
         # controller assignment
         assign, assign_issues = self._assignment(p)
@@ -293,7 +305,9 @@ class CapabilityGraph:
         # driver must match the controller it is placed on (usb/mmc host drivers)
         for x in p["peripherals"]:
             c = ctrl_by_name.get(assign.get(x["uid"], ""), {})
-            if x.get("driver") and x["category"] in ("usb_host", "usb_device", "mmc") and c.get("driver_family"):
+            sdio_dev = x["category"] == "mmc" and (self.cat.get("ic", x["ic"]) or {}).get("interface") == "sdio" if x.get("ic") else False
+            # an SDIO function (Wi-Fi) has its own driver; the host controller driver runs underneath it
+            if x.get("driver") and x["category"] in ("usb_host", "usb_device", "mmc") and c.get("driver_family") and not sdio_dev:
                 known = {d["id"] for d in self.cat.list("driver")}
                 if c["driver_family"] in known and x["driver"] != c["driver_family"]:
                     issues.append(Issue("driver-controller-mismatch", "error",
@@ -392,8 +406,8 @@ class CapabilityGraph:
             out.append(d)
         blocking = [d for d in out if d["severity"] == "error" and d["blocking"] and not d["waived"]]
         conflicts = [d for d in out if d["kind"] in ("pinmux", "clock", "dma", "memmap", "power", "address", "bandwidth") and d["severity"] == "error" and not d["waived"]]
-        peri_invalid = [d for d in blocking if d["uid"] or d["code"] in ("no-soc", "unknown-soc", "board-soc-mismatch", "ram-missing", "ram-unsupported", "no-controller")]
-        sw_invalid = [d for d in blocking if d["code"] in ("release-unknown", "kernel-unsupported", "distro-missing")]
+        peri_invalid = [d for d in blocking if d["uid"] or d["code"] in ("no-soc", "unknown-soc", "board-soc-unknown", "board-soc-mismatch", "ram-missing", "ram-unsupported", "no-controller")]
+        sw_invalid = [d for d in blocking if d["code"] in ("release-unknown", "kernel-unsupported", "distro-missing", "distro-arch")]
         has_soc = bool(p.get("soc"))
         sections = {
             "peripherals": has_soc and not peri_invalid and not conflicts,

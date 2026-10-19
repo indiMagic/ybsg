@@ -56,6 +56,19 @@ def add_peripheral(p: dict, category: str, ic: str = "", driver: str = "", *, mo
     return item
 
 
+def normalize_ids(cat, p: dict) -> dict:
+    """DB-6: ids merged away by deduplication are mapped to the record that absorbed them."""
+    for key, ent in (("board", "board"), ("soc", "soc")):
+        if p.get(key):
+            p[key] = cat.resolve_id(ent, p[key])
+    for x in p.get("peripherals", []):
+        if x.get("ic"):
+            x["ic"] = cat.resolve_id("ic", x["ic"])
+        if x.get("driver"):
+            x["driver"] = cat.resolve_id("driver", x["driver"])
+    return p
+
+
 def remove_peripheral(p: dict, uid: str) -> None:
     p["peripherals"] = [x for x in p["peripherals"] if x["uid"] != uid]
     touch(p)

@@ -1,6 +1,7 @@
 """Desktop launcher: native splash (UI-13/UI-14) -> local server -> app window. No runtime needed beyond the bundle."""
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import sys
@@ -84,11 +85,23 @@ def _window(url: str) -> None:
         return
     except Exception:
         pass
-    for exe in ("msedge", "microsoft-edge", "google-chrome", "chromium", "chromium-browser", "chrome"):
-        path = shutil.which(exe)
-        if path:
-            subprocess.Popen([path, f"--app={url}", "--window-size=1360,860"])
-            return
+    # Try each browser in turn. One that dies at start-up (for example Chrome on Ubuntu 24.04 when its AppArmor
+    # profile is not loaded and the user-namespace sandbox is refused) is skipped, never left as a crash dialog.
+    chromium = ("msedge", "microsoft-edge", "google-chrome", "chromium", "chromium-browser", "chrome")
+    tries = [[p, f"--app={url}", "--window-size=1360,860"] for p in dict.fromkeys(filter(None, map(shutil.which, chromium)))]
+    tries += [[p, "--new-window", url] for p in filter(None, [shutil.which("firefox")])]
+    for cmd in tries:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        try:
+            if proc.wait(timeout=5) == 0:
+                return  # handed the window to an already running browser
+            logging.warning("%s exited with %s at start-up; trying the next browser", cmd[0], proc.returncode)
+        except subprocess.TimeoutExpired:
+            return  # still running: the window is up
+    print(f"Open {url} in a web browser.", flush=True)
     webbrowser.open(url)
 
 

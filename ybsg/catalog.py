@@ -6,8 +6,11 @@ level (DB-5, DB-8). User records are flagged and never overwritten by sync (DB-7
 from __future__ import annotations
 
 import difflib
+import functools
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import threading
 import time
@@ -44,8 +47,30 @@ CREATE TABLE IF NOT EXISTS discovered (
 CONF_RANK = {"high": 3, "medium": 2, "unverified": 1}
 
 
+_NON_ALNUM = re.compile(r"[\W_]+")
+
+
 def _compact(s: str) -> str:
-    return "".join(ch for ch in s.lower() if ch.isalnum())
+    return _NON_ALNUM.sub("", s.lower())
+
+
+def _trigrams(t: str) -> set[str]:
+    t = f" {t} "
+    return {t[i:i + 3] for i in range(len(t) - 2)}
+
+
+ALIAS_FILE = Path(__file__).parent / "data" / "aliases.json"
+_VENDOR_ALIASES: dict[str, str] | None = None
+
+
+@functools.lru_cache(maxsize=4096)
+def canonical_vendor(name: str) -> str:
+    """DB-6: map a vendor spelling to its canonical name (aliases.json); unknown names come back unchanged."""
+    global _VENDOR_ALIASES
+    if _VENDOR_ALIASES is None:
+        data = json.loads(ALIAS_FILE.read_text(encoding="utf-8"))["vendors"] if ALIAS_FILE.exists() else {}
+        _VENDOR_ALIASES = {_compact(a): canon for canon, al in data.items() for a in [canon, *al]}
+    return _VENDOR_ALIASES.get(_compact(name or ""), name or "")
 
 
 def driver_binds(drv: dict, ic: dict) -> bool:
@@ -122,8 +147,11 @@ class Catalog:
         raw = sqlite3.connect(str(self.path), check_same_thread=False)
         raw.row_factory = sqlite3.Row
         self.db = _LockedConn(raw, self._lock)
+        self._batch = 0  # >0 inside bulk(): commit once at the end (NFR-1: fast sync of large catalogues)
+        self._index: dict[str, list[tuple]] | None = None  # search index, rebuilt lazily after any write
         self.db.executescript(SCHEMA)
-        if not self.get_meta("seed_version"):
+        shipped = json.loads(SEED_FILE.read_text(encoding="utf-8"))["meta"]["version"]
+        if self.get_meta("seed_version") != shipped:  # first run, or the app shipped a newer snapshot
             self.load_seed()
 
     # ---- meta -------------------------------------------------------------
@@ -138,17 +166,24 @@ class Catalog:
 
     # ---- seed -------------------------------------------------------------
     def load_seed(self, seed_path: Path = SEED_FILE) -> int:
+        from .signing import snapshot_status
+        sig = snapshot_status(seed_path)
+        if sig["state"] == "invalid" and not os.environ.get("YBSG_ALLOW_UNSIGNED"):
+            raise RuntimeError(f"Catalogue snapshot {seed_path.name} failed its signature check ({sig['detail']}). "
+                               "Reinstall YBSG, or set YBSG_ALLOW_UNSIGNED=1 while developing (NFR-7)")
         seed = json.loads(seed_path.read_text(encoding="utf-8"))
         n = 0
         stamp = seed["meta"]["built"] + "T00:00:00Z"
         mapping = {"releases": "release", "kernels": "kernel", "socs": "soc", "boards": "board",
                    "ics": "ic", "drivers": "driver", "rules": "rule"}
-        for key, ent in mapping.items():
-            for rec in seed.get(key, []):
-                url = rec.get("datasheet") or rec.get("url") or "ybsg:seed"
-                self.upsert(ent, rec, source_url=url or "ybsg:seed", fetched=stamp,
-                            confidence="medium", from_sync=True)
-                n += 1
+        with self.bulk():
+            for key, ent in mapping.items():
+                for rec in seed.get(key, []):
+                    url = rec.get("datasheet") or rec.get("url") or "ybsg:seed"
+                    self.upsert(ent, rec, source_url=url or "ybsg:seed", fetched=stamp,
+                                confidence="medium", from_sync=True)
+                    n += 1
+        self.set_meta("seed_signature", sig["state"])
         self.set_meta("seed_version", seed["meta"]["version"])
         self.set_meta("seed_built", seed["meta"]["built"])
         self.set_meta("last_sync", stamp)
@@ -162,6 +197,27 @@ class Catalog:
         return h.hexdigest()
 
     # ---- CRUD -------------------------------------------------------------
+    def _commit(self) -> None:
+        self._index = None
+        if not self._batch:
+            self.db.commit()
+
+    def bulk(self):
+        """`with cat.bulk(): ...` groups many writes into one transaction."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def cm():
+            with self._lock:
+                self._batch += 1
+                try:
+                    yield self
+                finally:
+                    self._batch -= 1
+                    if not self._batch:
+                        self.db.commit()
+        return cm()
+
     def upsert(self, entity: str, rec: dict, *, source_url: str = "", fetched: str | None = None,
                confidence: str = "medium", user: bool = False, from_sync: bool = False) -> str:
         """Insert/update. Sync never overwrites a user record (DB-7); it only changes differing fields."""
@@ -178,7 +234,7 @@ class Catalog:
                 old = json.loads(cur["data"])
                 if content_hash(old) == h:
                     self.db.execute("UPDATE record SET fetched=? WHERE entity=? AND id=?", (fetched or now(), entity, rid))
-                    self.db.commit()
+                    self._commit()
                     return "unchanged"
             self.db.execute(
                 """INSERT INTO record(entity,id,name,vendor,data,source_url,fetched,hash,confidence,user)
@@ -189,7 +245,7 @@ class Catalog:
                 (entity, rid, rec.get("name") or rec.get("part") or rid, rec.get("vendor", ""),
                  json.dumps(rec), source_url, fetched or now(), h,
                  "unverified" if user else confidence, 1 if user else 0))
-            self.db.commit()
+            self._commit()
             return "updated" if cur else "inserted"
 
     def add_user_record(self, entity: str, rec: dict) -> str:
@@ -201,7 +257,7 @@ class Catalog:
             self.db.execute("DELETE FROM record WHERE entity=? AND id=?", (entity, rid))
             if entity == "board":
                 self.db.execute("DELETE FROM board_image WHERE board_id=?", (rid,))
-            self.db.commit()
+            self._commit()
 
     @staticmethod
     def _row(r: sqlite3.Row) -> dict:
@@ -244,48 +300,139 @@ class Catalog:
         return [b for b in self.list("board") if b.get("soc") == soc_id]
 
     # ---- search (FR-2): type-ahead, filters, fuzzy -----------------------------
+    def _search_index(self) -> dict:
+        """Cached until a write. rows: entity -> [(id, name, vendor, confidence, user, hay, compact hay, canonical vendor,
+        data json, key)]; tokens: token -> row keys; grams: trigram -> tokens (fuzzy candidates without a full scan)."""
+        idx = self._index
+        if idx is None:
+            rows: dict[str, list[tuple]] = {}
+            tokens: dict[str, list[tuple[str, str]]] = {}
+            for r in self.db.execute("SELECT entity,id,name,vendor,confidence,user,data FROM record"):
+                hay = f"{r['name']} {r['vendor']} {r['id']}".lower()
+                key = (r["entity"], r["id"])
+                rows.setdefault(r["entity"], []).append((r["id"], r["name"], r["vendor"], r["confidence"], bool(r["user"]), hay,
+                                                         _compact(hay), canonical_vendor(r["vendor"]), r["data"], key))
+                for t in set(hay.replace("-", " ").split()):
+                    tokens.setdefault(t, []).append(key)
+            grams: dict[str, set[str]] = {}
+            for t in tokens:
+                for g in _trigrams(t):
+                    grams.setdefault(g, set()).add(t)
+            by_key = {row[9]: row for rs in rows.values() for row in rs}
+            idx = self._index = {"rows": rows, "tokens": tokens, "grams": grams, "by_key": by_key}
+        return idx
+
     def search(self, q: str, types: Iterable[str] = ("soc", "board", "ic", "driver"), limit: int = 30,
                vendor: str = "", arch: str = "", min_cores: int = 0, price_band: str = "",
                availability: str = "") -> list[dict]:
         q = (q or "").strip().lower()
-        results: list[tuple[float, dict]] = []
+        qc, qv = _compact(q), canonical_vendor(q) if q else ""
+        alias_q = bool(q) and qv != q
+        want_v = canonical_vendor(vendor) if vendor else ""
+        types = tuple(types)
+        soc_filter = bool(arch or min_cores or price_band or availability)
+
+        def passes(row: tuple, ent: str) -> bool:
+            if vendor and vendor.lower() not in (row[2] or "").lower() and want_v != row[7]:
+                return False
+            if ent == "soc" and soc_filter:
+                d = json.loads(row[8])
+                if (arch and d.get("arch") != arch) or (min_cores and d.get("cores", 0) < min_cores) \
+                        or (price_band and d.get("price_band") != price_band) \
+                        or (availability and availability.lower() not in str(d.get("availability", "")).lower()):
+                    return False
+            return True
+
+        filtered = bool(vendor) or soc_filter
+        hits: list[tuple[float, tuple, str]] = []
+        idx = self._search_index()
         for ent in types:
-            for r in self.db.execute("SELECT * FROM record WHERE entity=?", (ent,)):
-                d = json.loads(r["data"])
-                if vendor and vendor.lower() not in (r["vendor"] or "").lower():
-                    continue
-                if ent == "soc":
-                    if arch and d.get("arch") != arch:
-                        continue
-                    if min_cores and d.get("cores", 0) < min_cores:
-                        continue
-                    if price_band and d.get("price_band") != price_band:
-                        continue
-                    if availability and availability.lower() not in str(d.get("availability", "")).lower():
-                        continue
-                hay = f"{r['name']} {r['vendor']} {r['id']}".lower()
+            for row in idx["rows"].get(ent, []):
+                hay = row[5]
+                if alias_q and qv == row[7]:
+                    hay = f"{q} {hay}"  # an alias of this record's vendor ("freescale" finds NXP parts)
                 if not q:
                     score = 0.1
                 elif hay.startswith(q) or f" {q}" in hay:
                     score = 1.0
                 elif q in hay:
                     score = 0.8
-                elif _compact(q) and _compact(q) in _compact(hay):
+                elif qc and qc in row[6]:
                     score = 0.75
                 else:
-                    best = max([difflib.SequenceMatcher(None, q, t).ratio() for t in hay.replace("-", " ").split()] or [0])
-                    score = best if best >= 0.6 else 0
-                if score:
-                    results.append((score, {"type": ent, "id": r["id"], "name": r["name"], "vendor": r["vendor"],
-                                            "confidence": r["confidence"], "user": bool(r["user"])}))
-        results.sort(key=lambda t: (-t[0], t[1]["name"]))
-        return [r for _, r in results[:limit]]
+                    continue
+                if not filtered or passes(row, ent):
+                    hits.append((score, row, ent))
+        if q and len(hits) < limit:
+            # fuzzy pass only when exact/substring matching found too little. Candidate tokens come from the trigram
+            # index (a 0.6 match always shares trigrams with the query), so this never scans the whole catalogue.
+            matched = {h[1][9] for h in hits}
+            shared: dict[str, int] = {}
+            for g in _trigrams(q):
+                for t in idx["grams"].get(g, ()):
+                    shared[t] = shared.get(t, 0) + 1
+            best: dict[tuple, float] = {}
+            for t, _n in sorted(shared.items(), key=lambda kv: -kv[1])[:500]:
+                sm = difflib.SequenceMatcher(None, q, t)
+                if sm.real_quick_ratio() >= 0.6 and sm.quick_ratio() >= 0.6:
+                    ratio = sm.ratio()
+                    if ratio >= 0.6:
+                        for key in idx["tokens"][t]:
+                            if key[0] in types and key not in matched and ratio > best.get(key, 0):
+                                best[key] = ratio
+            if best:
+                by_key = idx["by_key"]
+                hits += [(sc, by_key[k], k[0]) for k, sc in best.items() if not filtered or passes(by_key[k], k[0])]
+        hits.sort(key=lambda t: (-t[0], t[1][1]))
+        return [{"type": ent, "id": row[0], "name": row[1], "vendor": row[2], "confidence": row[3], "user": row[4]}
+                for _, row, ent in hits[:limit]]
+
+    # ---- DB-6: duplicates and merging -------------------------------------------
+    def dedupe_key(self, entity: str, rec: dict) -> str:
+        if entity == "board" and rec.get("machine"):
+            return "machine:" + rec["machine"]
+        return f"{_compact(canonical_vendor(rec.get('vendor', '')))}:{_compact(rec.get('part') or rec.get('name') or rec['id'])}"
+
+    def find_duplicates(self, entity: str) -> list[list[str]]:
+        """Groups of record ids that describe the same thing (same canonical vendor + compact name, or same machine)."""
+        groups: dict[str, list[str]] = {}
+        for r in self.list(entity):
+            groups.setdefault(self.dedupe_key(entity, r), []).append(r["id"])
+        return [sorted(v) for v in groups.values() if len(v) > 1]
+
+    def merge(self, entity: str, keep: str, drop: str) -> dict:
+        """Merge `drop` into `keep`: keep's values win, missing fields come from drop, drop's id becomes an alias.
+        User records are never merged away or changed by this (DB-7)."""
+        a, b = self.get(entity, keep), self.get(entity, drop)
+        if not a or not b:
+            raise KeyError(f"{entity} {keep if not a else drop} not found")
+        if a["_prov"]["user"] or b["_prov"]["user"]:
+            raise PermissionError("user records are never merged automatically; edit them yourself")
+        rank = {"unverified": 0, "medium": 1, "high": 2}
+        merged = {k: v for k, v in b.items() if k != "_prov"}
+        merged.update({k: v for k, v in a.items() if k != "_prov" and v not in (None, "", [], {})})
+        merged["id"] = keep
+        merged["aliases"] = sorted(set(a.get("aliases", [])) | set(b.get("aliases", [])) | {drop})
+        conf = max(a["_prov"]["confidence"], b["_prov"]["confidence"], key=lambda c: rank.get(c, 0))
+        self.upsert(entity, merged, source_url=a["_prov"]["source_url"], confidence=conf)
+        self.delete(entity, drop)
+        self.log("dedupe", "saved", f"Merged {entity} {drop} into {keep}")
+        return self.get(entity, keep)  # type: ignore[return-value]
+
+    def resolve_id(self, entity: str, rid: str) -> str:
+        """An id that was merged away still resolves to the record that absorbed it (old project files keep working)."""
+        if self.get(entity, rid):
+            return rid
+        for r in self.list(entity):
+            if rid in r.get("aliases", []):
+                return r["id"]
+        return rid
 
     # ---- data-quality rule (6.3) ---------------------------------------------
     def mark_disputed(self, entity: str, rid: str, note: str) -> None:
         with self._lock:
             self.db.execute("UPDATE record SET disputed=1, dispute_note=? WHERE entity=? AND id=?", (note, entity, rid))
-            self.db.commit()
+            self._commit()
 
     def resolve_value(self, board: dict, field: str, sources: dict[str, Any]) -> tuple[Any, bool]:
         """If sources disagree, flag disputed and prefer the device-tree value for generation."""
@@ -296,8 +443,11 @@ class Catalog:
         return next(iter(vals.values())) if vals else None, False
 
     # ---- images (DB-12, DB-18) -------------------------------------------------
-    def set_image(self, board_id: str, mime: str, blob: bytes, source_url: str, licence: str, attribution: str = "") -> None:
-        shareable = 1 if licence and licence.lower() not in ("", "unknown", "unclear") else 0
+    def set_image(self, board_id: str, mime: str, blob: bytes, source_url: str, licence: str, attribution: str = "",
+                  shareable: bool | None = None) -> None:
+        if shareable is None:
+            shareable = bool(licence) and licence.lower() not in ("", "unknown", "unclear")
+        shareable = 1 if shareable else 0
         with self._lock:
             self.db.execute(
                 """INSERT INTO board_image(board_id,mime,blob,source_url,licence,attribution,shareable,fetched,hash)

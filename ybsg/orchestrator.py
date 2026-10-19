@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -59,13 +60,99 @@ def resource_check() -> dict:
     return {"cpus": cpus, "mem_gb": round(mem_gb, 1), "disk_gb": round(disk_gb, 1), "ok": not warn, "warnings": warn}
 
 
+def settings() -> dict:
+    f = paths.data_dir() / "settings.json"
+    try:
+        return json.loads(f.read_text()) if f.exists() else {}
+    except ValueError:
+        return {}
+
+
+def save_settings(**kw) -> dict:
+    cur = {**settings(), **kw}
+    f = paths.data_dir() / "settings.json"
+    tmp = f.with_suffix(".tmp"); tmp.write_text(json.dumps(cur, indent=2)); tmp.replace(f)
+    return cur
+
+
+def remote_builder() -> tuple[str, str] | None:
+    """FR-16: 'user@host:/dir' from YBSG_REMOTE_BUILDER or settings.json remote_builder. The host needs kas (or
+    kas-container with Docker/Podman); this machine needs ssh with key login and rsync."""
+    spec = (os.environ.get("YBSG_REMOTE_BUILDER") or settings().get("remote_builder") or "").strip()
+    if not spec:
+        return None
+    host, _, rdir = spec.partition(":")
+    return host, rdir or "ybsg-builds"
+
+
+def _wsl_run(args: list[str], timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["wsl.exe", *args], capture_output=True, timeout=timeout)
+
+
+def parse_wsl_list(raw: bytes) -> list[dict]:
+    """`wsl.exe -l -v` prints UTF-16LE: '  NAME STATE VERSION' then '* Ubuntu Running 2'. Returns [{name, state, version, default}]."""
+    text = raw.decode("utf-16-le", errors="ignore") if raw[:2] == b"\xff\xfe" or b"\x00" in raw[:20] else raw.decode(errors="ignore")
+    out = []
+    for line in text.replace("\x00", "").splitlines()[1:]:
+        default = line.lstrip().startswith("*")
+        parts = line.replace("*", " ").split()
+        if len(parts) >= 3 and parts[-1].isdigit():
+            out.append({"name": " ".join(parts[:-2]), "state": parts[-2], "version": int(parts[-1]), "default": default})
+    return out
+
+
+def detect_wsl() -> dict | None:
+    """PKG-4: the WSL2 distribution to build in, preferring the default one with kas installed. None when unusable,
+    with the reason in `problem` when WSL exists but cannot build."""
+    if not sys.platform.startswith("win") or not shutil.which("wsl.exe"):
+        return None
+    try:
+        distros = parse_wsl_list(_wsl_run(["-l", "-v"]).stdout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"problem": f"wsl.exe failed: {e}"}
+    v2 = sorted((d for d in distros if d["version"] == 2), key=lambda d: not d["default"])
+    if not v2:
+        return {"problem": "WSL is installed but no WSL2 distribution exists (run: wsl --install -d Ubuntu-24.04)" if not distros
+                else "Only WSL1 distributions found; convert one with: wsl --set-version <name> 2"}
+    for d in v2:
+        r = _wsl_run(["-d", d["name"], "--", "sh", "-lc", "command -v kas || command -v kas-container; command -v rsync"])
+        tools = r.stdout.decode(errors="ignore")
+        if "kas" in tools and "rsync" in tools:
+            return {"distro": d["name"], "kas": "kas-container" if "kas-container" in tools and "/kas\n" not in tools else "kas"}
+    return {"problem": f"No WSL2 distribution has kas and rsync; in {v2[0]['name']} run: sudo apt install rsync && pipx install kas"}
+
+
 def find_build_backend() -> list[str] | None:
-    """kas natively, or kas-container (needs Docker/Podman). On Windows this runs in WSL2 or a container (PKG-4)."""
+    """kas natively, or kas-container (needs Docker/Podman). On Windows: kas inside a WSL2 distribution (PKG-4)."""
     if shutil.which("kas"):
         return ["kas"]
     if shutil.which("kas-container") and (shutil.which("docker") or shutil.which("podman")):
         return ["kas-container"]
+    w = detect_wsl()
+    if w and w.get("distro"):
+        return ["wsl", w["distro"], w["kas"]]
+    if not sys.platform.startswith("win") and shutil.which("git") and shutil.which("bash") and shutil.which("python3"):
+        return ["native"]  # plain BitBake from the generated build.sh: no kas, no container
     return None
+
+
+def component_licences(licdir: Path) -> list[dict]:
+    """NFR-14: per-package licence inventory from the newest image license.manifest that BitBake wrote."""
+    mans = sorted(licdir.glob("**/license.manifest"), key=lambda f: f.stat().st_mtime) if licdir.exists() else []
+    if not mans:
+        return []
+    rows, cur = [], {}
+    for line in mans[-1].read_text(errors="replace").splitlines() + [""]:
+        if not line.strip():
+            if cur.get("package"):
+                rows.append(cur)
+            cur = {}
+            continue
+        k, _, v = line.partition(":")
+        key = {"PACKAGE NAME": "package", "PACKAGE VERSION": "version", "RECIPE NAME": "recipe", "LICENSE": "licence"}.get(k.strip())
+        if key:
+            cur[key] = v.strip()
+    return sorted(rows, key=lambda r: r["package"])
 
 
 def notify(title: str, msg: str) -> None:
@@ -341,17 +428,85 @@ class Job:
         rc = resource_check()
         for w in rc["warnings"]:
             self.add_log("build", "warning", f"Host below recommended size: {w}. Builds will be slow or may fail (NFR-4).")
+        rb = remote_builder()
+        if rb:
+            return self._stage_build_remote(*rb)
         backend = find_build_backend()
+        if backend and backend[0] == "native":
+            args = ["-n", f"{self.gen.slug}-image"] if os.environ.get("YBSG_BUILD_DRYRUN") else []
+            rc_ = self._stream(["bash", str(self.outdir / "build.sh"), *args], dict(os.environ))
+            if rc_ != 0:
+                raise GenerationError("build", f"BitBake exited with code {rc_}; the log above has the reason (host packages, network or a recipe error)")
+            return self._collect_deploy()
+        if backend and backend[0] == "wsl":
+            return self._stage_build_wsl(backend[1], backend[2])
         if not backend:
-            raise GenerationError("build", "No build backend found. Install Docker or Podman with kas-container (Windows: WSL2), or point YBSG at a remote builder.")
+            raise GenerationError("build", "No build backend found: building needs git, bash and python3 (plain BitBake), or kas, or WSL2 on Windows, or a remote builder (Settings).")
         kas_file = self.outdir / "kas" / f"{self.gen.slug}.yml"
         cmd = backend + ["build", str(kas_file)]
-        self.add_log("build", "info", "Running: " + " ".join(cmd))
+        env = {**os.environ, "KAS_WORK_DIR": str(self.outdir)}  # the kas file's layer path is relative to the work dir
+        rc_ = self._stream(cmd, env)
+        if rc_ != 0:
+            raise GenerationError("build", f"Build backend exited with code {rc_}")
+        return self._collect_deploy()
+
+    def _stage_build_remote(self, host: str, rdir: str) -> StageResult:
+        """FR-16: copy the output to the remote builder, run kas there, stream its log back, fetch the images."""
+        for tool in ("ssh", "rsync"):
+            if not shutil.which(tool):
+                raise GenerationError("build", f"Remote builder {host} needs {tool} on this machine")
+        slug, machine = self.gen.slug, self.gen.machine
+        rpath = f"{rdir.rstrip('/')}/{slug}"
+        q = shlex.quote
+        ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30"]
+        steps = [
+            ("Preparing remote folder", ssh + [host, f"mkdir -p {q(rpath)}"]),
+            ("Copying the generated BSP", ["rsync", "-az", "--delete", "--exclude", "/build/", "--exclude", "/cache/", "--exclude", "/.ybsg*",
+                                           f"{self.outdir}/", f"{host}:{rpath}/"]),
+            ("Building on " + host, ssh[:1] + ["-tt"] + ssh[1:] + [host, f"cd {q(rpath)} && export KAS_WORK_DIR=\"$PWD\" && "
+                                     f"if command -v kas >/dev/null 2>&1; then kas build kas/{slug}.yml; else kas-container build kas/{slug}.yml; fi"]),
+            ("Fetching images", ["rsync", "-az", "--mkpath", f"{host}:{rpath}/build/tmp/deploy/images/{machine}/",
+                                 f"{self.outdir}/build/tmp/deploy/images/{machine}/"]),
+        ]
+        for label, cmd in steps:
+            self.add_log("build", "info", f"{label}: " + " ".join(cmd))
+            rc_ = self._stream(cmd, dict(os.environ))
+            if rc_ != 0:
+                raise GenerationError("build", f"{label} failed on the remote builder {host} (exit code {rc_})")
+        res = self._collect_deploy()
+        self.build_info["remote"] = f"{host}:{rpath}"
+        return StageResult("build", "done", res.message + f" (built on {host})")
+
+    def _stage_build_wsl(self, distro: str, kas: str) -> StageResult:
+        """PKG-4: build inside WSL2 on the Linux filesystem (BitBake on /mnt/c is slow and trips over permissions)."""
+        slug, machine = self.gen.slug, self.gen.machine
+        win = str(self.outdir.resolve())
+        src = _wsl_run(["-d", distro, "--", "wslpath", "-a", win]).stdout.decode(errors="ignore").strip()
+        if not src.startswith("/"):
+            raise GenerationError("build", f"Could not map {win} into WSL ({distro})")
+        q = shlex.quote
+        w = ["wsl.exe", "-d", distro, "--", "sh", "-lc"]
+        rp = f"$HOME/ybsg-builds/{slug}"
+        steps = [
+            ("Copying the BSP into WSL", w + [f'mkdir -p "{rp}" && rsync -a --delete --exclude /build/ --exclude /cache/ {q(src)}/ "{rp}/"']),
+            (f"Building in WSL ({distro})", w + [f'cd "{rp}" && export KAS_WORK_DIR="$PWD" && {kas} build kas/{slug}.yml']),
+            ("Fetching images", w + [f'mkdir -p {q(src)}/build/tmp/deploy/images/{machine} && rsync -a "{rp}/build/tmp/deploy/images/{machine}/" {q(src)}/build/tmp/deploy/images/{machine}/']),
+        ]
+        for label, cmd in steps:
+            self.add_log("build", "info", f"{label}: " + " ".join(cmd))
+            rc_ = self._stream(cmd, dict(os.environ))
+            if rc_ != 0:
+                raise GenerationError("build", f"{label} failed (exit code {rc_})")
+        res = self._collect_deploy()
+        self.build_info["wsl"] = distro
+        return StageResult("build", "done", res.message + f" (built in WSL2: {distro})")
+
+    def _stream(self, cmd: list[str], env: dict) -> int:
+        """Run a build command, forward its lines to the log and BitBake progress to the bar; honours pause/cancel."""
         popen_kw = {"preexec_fn": os.setsid} if not sys.platform.startswith("win") else {"creationflags": 0x00000200}
-        self._proc = subprocess.Popen(cmd, cwd=str(self.outdir), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, **popen_kw)
-        last_pct = 0.0
+        self._proc = subprocess.Popen(cmd, cwd=str(self.outdir), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, **popen_kw)
         for line in self._proc.stdout:  # type: ignore[union-attr]
-            line = line.rstrip()
+            line = line.rstrip().replace("\r", "")
             self._pause.wait()
             if self._cancel.is_set():
                 raise Cancelled()
@@ -367,13 +522,18 @@ class Job:
         self._proc = None
         if self._cancel.is_set():
             raise Cancelled()
-        if rc_ != 0:
-            raise GenerationError("build", f"Build backend exited with code {rc_}")
+        return rc_
+
+    def _collect_deploy(self) -> StageResult:
         deploy = self.outdir / "build" / "tmp" / "deploy" / "images" / self.gen.machine
         found = sorted(p.name for p in deploy.glob("*")) if deploy.exists() else []
         self.build_info = {"ran": True, "deploy": str(deploy), "images": found}
+        comps = component_licences(self.outdir / "build" / "tmp" / "deploy" / "licenses")
+        if comps:
+            self.build_info["component_licences"] = comps
+            self.add_log("build", "info", f"Licence inventory: {len(comps)} packages from the image license.manifest (NFR-14)")
         self.current["task"] = ""
-        return StageResult("build", "done", f"{len(found)} artefacts in deploy dir")
+        return StageResult("build", "done", f"{len(found)} artefacts in deploy dir" + (f", {len(comps)} packages in the licence inventory" if comps else ""))
 
     # ---- history (UI-P7) ----------------------------------------------------------------------------------
     def _record_history(self, started: float, outcome: str) -> None:

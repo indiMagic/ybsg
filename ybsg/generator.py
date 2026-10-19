@@ -30,7 +30,7 @@ STAGE_IDS = [s for s, _ in STAGES]
 
 TUNE = {
     "imx8mm": "arm/armv8a/tune-cortexa53.inc", "am625": "arm/armv8a/tune-cortexa53.inc",
-    "rk3568": "arm/armv8-2a/tune-cortexa55.inc", "bcm2711": "arm/armv8a/tune-cortexa72.inc",
+    "rk3568": "arm/armv8-2a/tune-cortexa55.inc", "bcm2711": "arm/armv8a/tune-cortexa72.inc", "bcm2712": "arm/armv8-2a/tune-cortexa76.inc",
     "imx6ull": "arm/armv7a/tune-cortexa7.inc", "stm32mp157": "arm/armv7a/tune-cortexa7.inc",
     "am335x": "arm/armv7a/tune-cortexa8.inc",
 }
@@ -103,9 +103,10 @@ KERNEL_RECIPE = {
     "am335x": {"vendor": "linux-ti-staging", "mainline-lts": "linux-ti-staging"}, "am625": {"vendor": "linux-ti-staging", "mainline-lts": "linux-ti-staging"},
     "stm32mp157": {"vendor": "linux-stm32mp", "mainline-lts": "linux-stm32mp"},
     "rk3568": {"vendor": "linux-rockchip", "mainline-lts": "linux-yocto"}, "bcm2711": {"vendor": "linux-raspberrypi", "mainline-lts": "linux-raspberrypi"},
+    "bcm2712": {"vendor": "linux-raspberrypi", "mainline-lts": "linux-raspberrypi"},
 }
 UBOOT_RECIPE = {"imx8mm": "u-boot-imx", "imx6ull": "u-boot-fslc", "am335x": "u-boot-ti-staging", "am625": "u-boot-ti-staging",
-                "stm32mp157": "u-boot-stm32mp", "rk3568": "u-boot-rockchip", "bcm2711": "u-boot"}
+                "stm32mp157": "u-boot-stm32mp", "rk3568": "u-boot-rockchip", "bcm2711": "u-boot", "bcm2712": "u-boot"}
 
 
 def slug(s: str) -> str:
@@ -138,7 +139,8 @@ class Generator:
         self.policy = policy  # merge | keep | replace  (GEN-12)
         self._log = log or (lambda stage, level, msg: None)
         self.offline, self.do_fetch = offline, fetch
-        self.layers = json.loads((DATA / "layers.json").read_text())
+        from .discover import load_layers
+        self.layers = load_layers()
         self.soc = cat.get("soc", project["soc"]) or {}
         self.board = cat.get("board", project["board"]) if project.get("board") else None
         self.slug = slug(project["name"])
@@ -231,11 +233,45 @@ class Generator:
         return StageResult("validate", "warning" if warn else "done", f"valid; {warn} warning(s), {sum(1 for i in v['issues'] if i.get('waived'))} waived")
 
     # =========================== stage 2: resolve ============================================
-    def _repos_needed(self) -> list[str]:
-        need = ["poky", "meta-openembedded"] + [l for l in self.soc.get("layers", []) if l in self.layers["repos"]]
+    def _bsp_layers(self) -> list[str]:
+        """Layers the board or SoC asks for directly (LAYERDEPENDS of the generated layer)."""
+        want = list(self.soc.get("layers", [])) + (list(self.board.get("layers", [])) if self.board else [])
         if self.p["image"] == "qt":
-            need.append("meta-qt6")
-        return sorted(dict.fromkeys(need), key=lambda r: (r not in ("poky", "meta-openembedded"), r))
+            want.append("meta-qt6")
+        return list(dict.fromkeys(want))
+
+    def _layer_repo(self, name: str) -> str:
+        r = self.layers["layer_catalog"][name]["repo"]
+        return r if isinstance(r, str) else r.get(self.p["release"], r["default"])
+
+    def layer_plan(self) -> list[str]:
+        """Base layers + BSP layers + everything they need, in dependency order (data: layers.json layer_catalog)."""
+        cat_, order, seen = self.layers["layer_catalog"], [], set()
+
+        def visit(n: str) -> None:
+            if n in seen:
+                return
+            seen.add(n)
+            if n not in cat_:
+                self.log("resolve", f"Layer {n} is not in layers.json; add it to layer_catalog", "warning")
+                return
+            for d in cat_[n]["needs"]:
+                visit(d)
+            order.append(n)
+
+        for n in self.layers["base_layers"] + self._bsp_layers():
+            visit(n)
+        return order
+
+    def _repos_needed(self) -> dict[str, list[str]]:
+        """repo -> layer paths, plus companion repos that carry no layer (bitbake next to openembedded-core)."""
+        out: dict[str, list[str]] = {}
+        for n in self.layer_plan():
+            out.setdefault(self._layer_repo(n), []).append(self.layers["layer_catalog"][n]["path"])
+        for repo in list(out):
+            for comp in self.layers.get("companions", {}).get(repo, []):
+                out.setdefault(comp, [])
+        return out
 
     def _ls_remote(self, url: str, ref: str) -> str | None:
         if self.offline:
@@ -249,9 +285,11 @@ class Generator:
     def stage_resolve(self) -> StageResult:
         rel = self.p["release"]
         unresolved = []
-        for repo in self._repos_needed():
+        for repo, repo_layers in self._repos_needed().items():
             meta = self.layers["repos"][repo]
-            branch = meta["branches"].get(rel, meta["branches"].get("master"))
+            branch = meta["branches"].get(rel)
+            if not branch:
+                raise GenerationError("resolve", f"{repo} has no branch for release {rel} in layers.json")
             have = self.p.get("pins", {}).get(repo, {})
             commit = have.get("commit") if have.get("branch") == branch else None
             if not commit:
@@ -261,7 +299,7 @@ class Generator:
             else:
                 unresolved.append(repo)
                 self.log("resolve", f"{repo}@{branch} could not be pinned (offline or unreachable); kas file will track the branch", "warning")
-            self.pins[repo] = {"url": meta["url"], "branch": branch, "commit": commit or "", "layers": meta["layers"], "licence_gate": meta.get("licence_gate", "")}
+            self.pins[repo] = {"url": meta["url"], "branch": branch, "commit": commit or "", "layers": repo_layers, "licence_gate": meta.get("licence_gate", "")}
             if commit:
                 self.p.setdefault("pins", {})[repo] = {"branch": branch, "commit": commit}
         if unresolved:
@@ -320,10 +358,15 @@ class Generator:
     def stage_layer(self) -> StageResult:
         L, s, rel = self.layer_name, self.slug, self.p["release"]
         series = self.layers["layer_series"].get(rel, rel)
-        deps = ["core", "openembedded-layer"] + ([{"meta-freescale": "freescale-layer", "meta-imx": "meta-imx-bsp"}.get(x, x) for x in self.soc.get("layers", [])])
-        if self.p["image"] == "qt":
-            deps.append("qt6-layer")
-        deps = sorted(dict.fromkeys(deps))
+        lc = self.layers["layer_catalog"]
+        bsp = set(self._bsp_layers())
+        # direct BSP layers and everything they need (yocto-check-layer adds exactly these when it tests this layer)
+        need, todo = set(), [x for x in bsp if x in lc]
+        while todo:
+            x = todo.pop()
+            if x not in need:
+                need.add(x); todo += [d for d in lc[x]["needs"] if d in lc]
+        deps = sorted(dict.fromkeys(["core", "openembedded-layer"] + [lc[x]["collection"] for x in need]))
         self.emit(f"{L}/conf/layer.conf", f'''# Generated by YBSG {__version__}. Layer for {self.p["name"]}.
 BBPATH .= ":${{LAYERDIR}}"
 BBFILES += "${{LAYERDIR}}/recipes-*/*/*.bb ${{LAYERDIR}}/recipes-*/*/*.bbappend"
@@ -339,13 +382,18 @@ LAYERDEPENDS_{s} = "{' '.join(deps)}"
         self.emit(f"{L}/README.md", f"# {L}\n\nBoard support layer for **{self.p['name']}** ({self.soc.get('name')}), generated by YBSG {__version__}.\n\n- Release: {self.rel.get('name', rel)} {self.rel.get('version', '')}\n- Machine: `{self.machine}`\n- Mode: {'thin overlay on ' + str(self.soc.get('layers')) if self._overlay() else 'from scratch'}\n\nMaintainer: {self.p.get('author') or brand()['designer']}\n")
         self.emit(f"{L}/conf/templates/default/conf-notes.txt", f"Generated by YBSG. Build the image with: bitbake {s}-image\n")
         self.emit(f"{L}/conf/templates/default/bblayers.conf.sample", self._bblayers_sample())
-        self.emit(f"{L}/conf/templates/default/local.conf.sample", f'MACHINE ??= "{self.machine}"\nDISTRO ?= "poky"\nPACKAGE_CLASSES ?= "package_ipk"\nEXTRA_IMAGE_FEATURES ?= "debug-tweaks"\nCONF_VERSION = "2"\n')
+        self.emit(f"{L}/conf/templates/default/local.conf.sample", f'MACHINE ??= "{self.machine}"\nDISTRO ?= "poky"\nPACKAGE_CLASSES ?= "package_ipk"\n'
+                  '# Development image: root login without a password. Remove for production.\n'
+                  f'EXTRA_IMAGE_FEATURES ?= "{self._dev_features()}"\n'
+                  'DL_DIR ?= "${TOPDIR}/../cache/downloads"\nSSTATE_DIR ?= "${TOPDIR}/../cache/sstate"\nCONF_VERSION = "2"\n')
         self.emit(f"{L}/conf/machine/{self.machine}.conf", self._machine_conf())
         self.emit(f"{L}/recipes-core/images/{s}-image.bb", self._image_recipe())
-        self.emit(f"{L}/wic/{s}.wks", self._wks())
+        wic_dir = "wic" if self.p["release"] == "scarthgap" else "files/wic"  # OE-core sanity check from Whinlatter on
+        self.emit(f"{L}/{wic_dir}/{s}.wks", self._wks())
         if any(x["category"] == "usb_device" for x in self.p["peripherals"]) or self.p.get("custom_usb"):
             self._gadget_recipe()
         self.emit(f"kas/{s}.yml", self._kas())
+        self.emit("build.sh", self._build_sh(), executable=True)
         self.emit("FLASHING.md", self._flashing_guide())
         if self.p["image"] == "distro":
             self._distro_rootfs()
@@ -353,6 +401,37 @@ LAYERDEPENDS_{s} = "{' '.join(deps)}"
 
     def _overlay(self) -> bool:
         return self.p.get("overlay_mode", "overlay") == "overlay" and bool(self.board and self.board.get("layers")) and bool(self.board.get("machine"))
+
+    def _dev_features(self) -> str:
+        # debug-tweaks was removed after Scarthgap; an image that still asks for it is skipped by BitBake
+        return "debug-tweaks" if self.p["release"] == "scarthgap" else "allow-empty-password allow-root-login empty-root-password"
+
+    def _build_sh(self) -> str:
+        """Plain BitBake build, no kas and no container: the usual oe-init-build-env + bitbake, at the pinned commits."""
+        core = self._layer_repo("meta")
+        q = lambda s_: "'" + s_.replace("'", "'\\''") + "'"
+        lines = [f"#!/bin/bash", f"# Build {self.p['name']} with plain BitBake (no kas, no container). Generated by YBSG {__version__}.",
+                 "# Run from anywhere:  ./build.sh            (builds the image)", f"#                    ./build.sh -c fetch {self.slug}-image   (any bitbake arguments)",
+                 "# Needs git, python3 and the Yocto host packages: https://docs.yoctoproject.org/ref-manual/system-requirements.html",
+                 "set -e", 'cd "$(dirname "$0")"', 'TOP="$PWD"', "",
+                 "fetch() {  # name url branch commit",
+                 '  [ -d "sources/$1/.git" ] || git clone -q --no-checkout "$2" "sources/$1"',
+                 '  if [ -n "$4" ]; then',
+                 '    git -C "sources/$1" fetch -q --depth 1 origin "$4" 2>/dev/null || git -C "sources/$1" fetch -q origin "$3"',
+                 '    git -C "sources/$1" checkout -q "$4"',
+                 "  else",
+                 '    git -C "sources/$1" fetch -q origin "$3" && git -C "sources/$1" checkout -q FETCH_HEAD',
+                 "  fi", "}", "mkdir -p sources"]
+        for repo, m in self.pins.items():
+            lines.append(f"fetch {repo} {q(m['url'])} {q(m['branch'])} {q(m['commit'] or '')}" + ("" if m["commit"] else "  # UNPINNED: tracks the branch"))
+        lines += ["", f'export TEMPLATECONF="$TOP/{self.layer_name}/conf/templates/default"']
+        if "bitbake" in self.pins:
+            lines.append('export BITBAKEDIR="$TOP/sources/bitbake"')
+        if self.p["release"] != "scarthgap":  # a build folder made by an older YBSG may still ask for the removed debug-tweaks
+            lines.append(f'[ -f build/conf/local.conf ] && sed -i \'s/"debug-tweaks"/"{self._dev_features()}"/\' build/conf/local.conf')
+        lines += ["set +e", f'. "$TOP/sources/{core}/oe-init-build-env" "$TOP/build" > /dev/null || exit 1', "set -e",
+                  f'bitbake "${{@:-{self.slug}-image}}"', ""]
+        return "\n".join(lines)
 
     def _bblayers_sample(self) -> str:
         lines = ["POKY_BBLAYERS_CONF_VERSION = \"2\"", "BBPATH = \"${TOPDIR}\"", "BSPDIR := \"${@os.path.abspath(os.path.dirname(d.getVar('FILE')) + '/../..')}\"", "", "BBLAYERS ?= \" \\"]
@@ -373,10 +452,11 @@ LAYERDEPENDS_{s} = "{' '.join(deps)}"
         if self._overlay():
             return head + f'''# Thin overlay (GEN-3): reuse the vendor/community machine and override only what the project changes.
 require conf/machine/{self.board["machine"]}.conf
-
-KERNEL_DEVICETREE = "{dtb}"
-SERIAL_CONSOLES = "{baud};{tty}"
-MACHINE_FEATURES:append = " {feats}"
+{self._kernel_conf()}
+# ":{self.machine}" beats the vendor's override-qualified values (the machine name is the last MACHINEOVERRIDES entry)
+KERNEL_DEVICETREE:append:{self.machine} = " {dtb}"
+SERIAL_CONSOLES:{self.machine} = "{baud};{tty}"
+{"" if s.get("keep_vendor_wks") else f'WKS_FILE:{self.machine} = "{self.slug}.wks"' + chr(10)}{self._machine_extra()}{self._provider_lines()}MACHINE_FEATURES:append = " {feats}"
 MACHINE_ESSENTIAL_EXTRA_RRECOMMENDS:append = " kernel-modules"
 '''
         arch = s.get("arch", "arm64")
@@ -396,6 +476,25 @@ IMAGE_FSTYPES = "wic wic.bmap ext4 tar.xz"
 WKS_FILE = "{self.slug}.wks"
 IMAGE_BOOT_FILES = "${{KERNEL_IMAGETYPE}} ${{KERNEL_DEVICETREE}} boot.scr"
 '''
+
+    def _machine_extra(self) -> str:
+        """SoC-specific machine lines from the catalogue, e.g. Raspberry Pi config.txt `device_tree=` so the firmware loads our DTB."""
+        lines = [x.format(machine=self.machine, slug=self.slug) for x in self.soc.get("machine_extra", [])]
+        return "".join(l + "\n" for l in lines)
+
+    def _provider_lines(self) -> str:
+        """Pin the providers the generated .bbappend files extend, only where the SoC data says which ones the chosen
+        kernel uses (verified against the vendor layer); otherwise the vendor machine's own choice stands."""
+        if not self.soc.get("pin_providers") or self.p["kernel"] not in self.soc.get("kernel_conf", {}):
+            return ""
+        k, u, m = self._kernel_recipe_name(), self._uboot_recipe_name(), self.machine
+        return (f'PREFERRED_PROVIDER_virtual/kernel:{m} = "{k}"\nPREFERRED_PROVIDER_virtual/bootloader:{m} = "{u}"\n'
+                f'PREFERRED_PROVIDER_u-boot:{m} = "{u}"\n')
+
+    def _kernel_conf(self) -> str:
+        """Vendor switches that select the kernel/U-Boot for the chosen kernel (seed: soc.kernel_conf), e.g. meta-ti's BSP profile."""
+        lines = self.soc.get("kernel_conf", {}).get(self.p["kernel"], [])
+        return ("\n# Kernel choice " + self.p["kernel"] + "\n" + "\n".join(lines) + "\n") if lines else ""
 
     def _kernel_recipe_name(self) -> str:
         k = self.p["kernel"]
@@ -438,7 +537,7 @@ bootloader --ptable msdos
 
     def _kas(self) -> str:
         rel = self.p["release"]
-        out = [f"# kas project file generated by YBSG {__version__}.", "# Build:  kas-container build kas/%s.yml" % self.slug, "header:", "  version: 14", f"machine: {self.machine}", "distro: poky", f"target: {self.slug}-image", "repos:"]
+        out = [f"# kas project file generated by YBSG {__version__}.", "# Build from the output folder:  kas-container build kas/%s.yml" % self.slug, "header:", "  version: 14", f"machine: {self.machine}", "distro: poky", f"target: {self.slug}-image", "repos:"]
         for repo, m in self.pins.items():
             out += [f"  {repo}:", f"    url: {m['url']}"]
             if m["commit"]:
@@ -446,9 +545,11 @@ bootloader --ptable msdos
             else:
                 out += [f"    branch: {m['branch']}  # UNPINNED: re-run YBSG online to pin a commit (GEN-2)"]
             out.append("    layers:")
+            if not m["layers"]:  # tool repo such as bitbake: checked out, not a layer
+                out.append("      .: disabled")
             for l in m["layers"]:
                 out.append(f"      {l}:" if l != "." else "      .:")
-        out += [f"  {self.layer_name}:", f"    path: ../{self.layer_name}", "local_conf_header:", "  ybsg: |", f'    # {self.p["name"]}', "    BB_NUMBER_THREADS ?= \"${@oe.utils.cpu_count()}\"", '    PARALLEL_MAKE ?= "-j ${@oe.utils.cpu_count()}"',
+        out += [f"  {self.layer_name}:", f"    path: {self.layer_name}  # relative to KAS_WORK_DIR: run kas from the output folder", "local_conf_header:", "  ybsg: |", f'    # {self.p["name"]}', "    BB_NUMBER_THREADS ?= \"${@oe.utils.cpu_count()}\"", '    PARALLEL_MAKE ?= "-j ${@oe.utils.cpu_count()}"',
                 '    DL_DIR ?= "${TOPDIR}/../cache/downloads"', '    SSTATE_DIR ?= "${TOPDIR}/../cache/sstate"']
         return "\n".join(out) + "\n"
 
@@ -518,23 +619,54 @@ Note: {self.soc.get("dram", "")}
     def _distro_rootfs(self) -> None:
         d = self.p.get("distro") or "debian"
         meta = self.layers["distro_rootfs"].get(d, {})
-        arch = "arm64" if self.soc.get("arch") == "arm64" else "armhf"
+        soc_arch = "arm64" if self.soc.get("arch") == "arm64" else "armhf"
+        arch = meta.get("arch", {}).get(soc_arch)
+        if not arch:
+            raise GenerationError("layer", f"{d} has no {soc_arch} root filesystem; choose another distribution")
+        m, suite, mirror, M = meta["method"], meta["suite"], meta["mirror"], self.machine
+        qemu = {"arm64": "aarch64", "armhf": "arm"}[soc_arch]
+        emul = f"""# {meta['tool']} runs target binaries: on a non-ARM host this needs qemu-user binfmt support
+if [ "$(uname -m)" != "{ {'arm64': 'aarch64', 'armhf': 'armv7l'}[soc_arch] }" ] && [ ! -e /proc/sys/fs/binfmt_misc/qemu-{qemu} ]; then
+  echo "Install qemu-user-static and binfmt-support (Debian/Ubuntu) or qemu-user-static (Fedora) first." >&2; exit 1
+fi
+"""
+        fetch = {
+            "debootstrap": emul + f'sudo debootstrap --arch={arch} {suite} "$ROOT" {mirror}',
+            "mmdebstrap": emul + f'sudo mmdebstrap --arch={arch} {suite} "$ROOT" {mirror}',
+            "dnf": emul + f"""sudo dnf -y --installroot="$ROOT" --forcearch={arch} --releasever={suite} \\
+  --repofrompath=ybsg-fedora,{mirror}/{suite}/Everything/{arch}/os/ --repo=ybsg-fedora \\
+  --setopt=ybsg-fedora.gpgcheck=1 --setopt=ybsg-fedora.gpgkey={meta.get('gpgkey', '')} \\
+  --setopt=install_weak_deps=False install @core""",
+            "archarm-tarball": f"""T=ArchLinuxARM-{arch}-latest.tar.gz
+curl -fLO {mirror}/$T && curl -fLO {mirror}/$T.md5
+md5sum -c $T.md5   # the mirror also publishes $T.sig for gpg --verify with the Arch Linux ARM build key
+sudo install -d "$ROOT" && sudo bsdtar -xpf $T -C "$ROOT" """.rstrip(),
+            "alpine-minirootfs": f"""REL={mirror}/{suite}/releases/{arch}
+F=$(curl -fsSL $REL/latest-releases.yaml | awk '/file: alpine-minirootfs/ {{print $2; exit}}')
+curl -fLO $REL/$F && curl -fL $REL/$F.sha256 -o $F.sha256
+sha256sum -c $F.sha256
+sudo install -d "$ROOT" && sudo tar -xzf $F -C "$ROOT" """.rstrip(),
+        }[m]
         script = f'''#!/bin/sh
 # Assembles a {d} rootfs around the Yocto-built bootloader, kernel and DTB (GEN-9).
 # NOTE: this rootfs is NOT built by Yocto and is outside Yocto's SBOM and CVE tracking.
 set -e
 ROOT=${{1:-./rootfs-{d}}}
-DEPLOY=${{2:-./build/tmp/deploy/images/{self.machine}}}
-sudo {meta.get("tool", "debootstrap")} --arch={arch} {meta.get("suite", "stable")} "$ROOT" {meta.get("mirror", "")}
+DEPLOY=${{2:-./build/tmp/deploy/images/{M}}}
+{fetch}
 # kernel modules from the Yocto build
-sudo tar -xf "$DEPLOY"/modules-{self.machine}.tgz -C "$ROOT"
-# boot files
+sudo tar -xf "$DEPLOY"/modules-{M}.tgz -C "$ROOT"
+# boot files: fail loudly if the build did not produce them
 sudo install -d "$ROOT/boot"
-sudo cp "$DEPLOY"/*Image* "$DEPLOY"/{self.slug}.dtb "$DEPLOY"/boot.scr "$ROOT/boot/" 2>/dev/null || true
-echo "Rootfs ready in $ROOT. Create the image with: wic create {self.slug} -e {self.slug}-image"
+for f in "$DEPLOY"/*Image "$DEPLOY"/{self.slug}.dtb "$DEPLOY"/boot.scr; do
+  [ -e "$f" ] || {{ echo "missing $f: build the image first (kas build kas/{self.slug}.yml)" >&2; exit 1; }}
+  sudo cp -L "$f" "$ROOT/boot/"
+done
+echo "Rootfs ready in $ROOT."
+echo "Create the disk image (inside the kas shell): wic create {self.slug} -e {self.slug}-image --rootfs-dir \"$ROOT\""
 '''
         self.emit("rootfs/assemble-rootfs.sh", script, executable=True)
-        self.emit("rootfs/README.md", f"# {d} rootfs path\n\nThe bootloader, kernel and device tree come from Yocto. The {d} root filesystem is assembled by `assemble-rootfs.sh` with `{meta.get('tool')}` and **is not Yocto-built**: it is outside Yocto's SBOM and CVE tracking. Test the kernel modules against this userland on your board.\n")
+        self.emit("rootfs/README.md", f"# {d} rootfs path\n\nThe bootloader, kernel and device tree come from Yocto. The {d} root filesystem is assembled by `assemble-rootfs.sh` with {meta.get('tool')} ({arch}) and **is not Yocto-built**: it is outside Yocto's SBOM and CVE tracking. Test the kernel modules against this userland on your board.\n")
 
     # =========================== stage 5: device tree ========================================
     def _dt_i2c(self, bus: str) -> str:
@@ -543,15 +675,22 @@ echo "Rootfs ready in $ROOT. Create the image with: wic create {self.slug} -e {s
         return self.soc.get("dt_i2c", "i2c{n}").format(n=n)
 
     def _bus_default(self) -> str:
-        return {"imx8mm": "i2c2", "imx6ull": "i2c1", "am335x": "i2c2", "stm32mp157": "i2c1", "rk3568": "i2c4", "bcm2711": "i2c1", "am625": "i2c1"}.get(self.soc["id"], "i2c0")
+        return {"imx8mm": "i2c2", "imx6ull": "i2c1", "am335x": "i2c2", "stm32mp157": "i2c1", "rk3568": "i2c4", "bcm2711": "i2c1", "bcm2712": "i2c1", "am625": "i2c1"}.get(self.soc["id"], "i2c0")
 
     def _node_comment(self, x: dict, indent: str = "") -> str:
         ic = self.cat.get("ic", x["ic"]) if x["ic"] else None
         return f"{indent}/* YBSG selection: {x['category']} / {ic['part'] if ic else 'custom IC'} / driver {x['driver'] or 'n/a'} */"
 
+    def _board_wired(self) -> set[tuple[str, str]]:
+        """(category, IC) pairs the board's base device tree already configures."""
+        if not (self.board or {}).get("base_dts"):
+            return set()
+        return {(x["category"], x.get("ic", "")) for x in self.board.get("preset", [])}
+
     def stage_dts(self) -> StageResult:
         s, p = self.soc, self.p
-        dtsi = Path(s.get("dtsi", "soc.dtsi")).name
+        # a board whose SoC needs board-level wiring (Pi 5: RP1 sits under pcie2) starts from the vendor board file
+        dtsi = (self.board or {}).get("base_dts") or Path(s.get("dtsi", "soc.dtsi")).name
         arm64 = s.get("arch") == "arm64"
         ram = p["ram"]
         base = int(s.get("ram_base", "0x0"), 16)
@@ -573,6 +712,10 @@ echo "Rootfs ready in $ROOT. Create the image with: wic create {self.slug} -e {s
             cat_, drv = x["category"], (self.cat.get("driver", x["driver"]) if x["driver"] else None)
             cm = self._node_comment(x)
             cmi = self._node_comment(x, "\t")  # inside an i2c bus block
+            if lab and (cat_, x.get("ic")) in self._board_wired():
+                # the vendor board file already wires this part (pins, PHY, card detect): only switch it on
+                out += [cm.removesuffix(" */") + f", wired by {self.board['base_dts']} */", f"&{lab} {{", '\tstatus = "okay";', "};", ""]
+                continue
             if cat_ in ("usb_host", "usb_device") and lab:
                 role = x.get("mode") or ("peripheral" if cat_ == "usb_device" else "host")
                 dr = {"device": "peripheral", "host": "host", "otg": "otg", "peripheral": "peripheral"}.get(role, "host")
@@ -787,6 +930,14 @@ addtask deploy after do_compile before do_build
         return StageResult("dryrun", "warning" if "deferred" in " ".join(notes) or "not installed" in " ".join(notes) else "done", "; ".join(notes))
 
     # =========================== stage 9: package ============================================
+    def _report_template(self) -> dict | None:
+        from .report import load_template
+        try:
+            return load_template(self.p.get("report_template"))
+        except (OSError, ValueError) as e:
+            self.log("package", f"Report template not used: {e}", "warning")
+            return None
+
     def build_manifest(self, build_info: dict | None = None) -> dict:
         s, p = self.soc, self.p
         peripherals, drivers = [], []
@@ -828,6 +979,7 @@ addtask deploy after do_compile before do_build
         gates = sorted({m["licence_gate"] for m in self.pins.values() if m["licence_gate"]} | ({s["licence_gate"]} if s.get("licence_gate", "none").lower() != "none" and not s.get("licence_gate", "none").lower().startswith("none") else set()))
         files = {k: {"sha256": v, "purpose": purpose(k)} for k, v in sorted(self.files.items()) if k != "bsp-manifest.json"}
         return {
+            "report_template": self._report_template(),
             "format": 1, "tool": {"name": brand()["product"], "version": __version__, "database_version": self.cat.get_meta("seed_version", ""), "database_synced": self.cat.get_meta("last_sync", "")},
             "project": {"name": p["name"], "slug": self.slug, "hash": self.project_hash(), "author": p.get("author") or brand()["designer"], "board": self.board["name"] if self.board else "custom board",
                         "soc": s["name"], "soc_vendor": s["vendor"], "mode": p["mode"], "overlay": self._overlay()},
@@ -866,6 +1018,10 @@ addtask deploy after do_compile before do_build
                 if cur == self.old_manifest["files"][old]["sha256"]:
                     (self.out / old).unlink()
                     self.changes["removed"].append(old)
+                    for d in (self.out / old).parents:  # drop folders the removal left empty, up to the output root
+                        if d == self.out or any(d.iterdir()):
+                            break
+                        d.rmdir()
                 else:
                     self.changes["user_kept"].append(old)
         self.manifest = m
